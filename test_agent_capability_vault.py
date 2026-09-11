@@ -2,11 +2,17 @@
 """
 Behavioral Agent Auditor — Verification & Regression Test Suite
 ==============================================================
-Validates all steward remediation requirements:
+Validates all steward remediation requirements (Joaquin - Sep 11, 2026):
 1. Capability-Specific Live Probing (Full URL preservation, no path truncation).
 2. Symmetrical 2-Way Validator Consensus Criteria (Strict rejection of false-positives & false-negatives).
 3. Deterministic Slashing & Zero Reverts (Unreachable endpoints slash 100% deposit without reverting).
-4. Stake Custody & Withdrawal Access Control.
+4. Stake Custody & Entitled Address Withdrawal:
+   - agent_balances tracks active deposited stake per agent address.
+   - withdraw_staked_deposit is strictly restricted to agent.agent_address when ATTESTED_ACTIVE.
+5. Permissionless Audits with Caller-Bound Reward Attribution:
+   - Caller cannot supply arbitrary challenger_address.
+   - Slashing rewards credit claimable_rewards[caller].
+   - Enforceable payout path via claim_challenger_reward() bound strictly to caller.
 """
 
 import os
@@ -20,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 
 class SimulatedAgentCapabilityVault:
     """
-    Simulates the exact state machine and 2-way validator consensus rules
+    Simulates the exact state machine, custody ledger, and 2-way validator consensus rules
     of agent_capability_vault.py.
     """
 
@@ -28,6 +34,14 @@ class SimulatedAgentCapabilityVault:
         self.owner = owner.lower()
         self.next_agent_id = 2
         self.total_staked_pool = 10000
+        self.total_slashed_pool = 0
+        self.total_claimed_rewards = 0
+        
+        self.agent_balances: Dict[str, int] = {
+            self.owner: 10000
+        }
+        self.claimable_rewards: Dict[str, int] = {}
+        
         self.agents: Dict[str, Dict[str, Any]] = {
             "AGENT_1": {
                 "id": "AGENT_1",
@@ -37,6 +51,7 @@ class SimulatedAgentCapabilityVault:
                 "staked_deposit": 5000,
                 "slashed_amount": 0,
                 "challenger_reward": 0,
+                "challenger_address": "0x0000000000000000000000000000000000000000",
                 "quality_score": 0,
                 "status": "PROBATION",
                 "last_probe_summary": "Seed Agent 1 initialized with 5000 stake."
@@ -49,6 +64,7 @@ class SimulatedAgentCapabilityVault:
                 "staked_deposit": 5000,
                 "slashed_amount": 0,
                 "challenger_reward": 0,
+                "challenger_address": "0x0000000000000000000000000000000000000000",
                 "quality_score": 0,
                 "status": "PROBATION",
                 "last_probe_summary": "Seed Agent 2 initialized with 5000 stake."
@@ -60,18 +76,15 @@ class SimulatedAgentCapabilityVault:
         endpoint_clean = endpoint.strip().strip('"').strip("'")
         capability_clean = capability.strip().strip('"').strip("'")
 
-        assert endpoint_clean.startswith("http://") or endpoint_clean.startswith("https://"), \
-            "[ERR_URL_01] Agent endpoint must be a valid HTTP or HTTPS URL."
-        assert len(endpoint_clean) > 10 and "." in endpoint_clean, \
-            "[ERR_URL_02] Invalid agent endpoint domain format."
-        assert len(capability_clean) >= 3, \
-            "[ERR_CAPABILITY_01] Claimed capability description cannot be empty."
-        assert stake_amount > 0, \
-            "[ERR_STAKE_01] Stake deposit amount must be greater than zero."
+        assert endpoint_clean.startswith("http://") or endpoint_clean.startswith("https://"),             "[ERR_URL_01] Agent endpoint must be a valid HTTP or HTTPS URL."
+        assert len(endpoint_clean) > 10 and "." in endpoint_clean,             "[ERR_URL_02] Invalid agent endpoint domain format."
+        assert len(capability_clean) >= 3,             "[ERR_CAPABILITY_01] Claimed capability description cannot be empty."
+        assert stake_amount > 0,             "[ERR_STAKE_01] Stake deposit amount must be greater than zero."
 
         self.next_agent_id += 1
         a_id = f"AGENT_{self.next_agent_id}"
         self.total_staked_pool += stake_amount
+        self.agent_balances[sender_clean] = self.agent_balances.get(sender_clean, 0) + stake_amount
 
         self.agents[a_id] = {
             "id": a_id,
@@ -81,6 +94,7 @@ class SimulatedAgentCapabilityVault:
             "staked_deposit": stake_amount,
             "slashed_amount": 0,
             "challenger_reward": 0,
+            "challenger_address": "0x0000000000000000000000000000000000000000",
             "quality_score": 0,
             "status": "PROBATION",
             "last_probe_summary": f"Agent registered with capability '{capability_clean}' and {stake_amount} tokens staked."
@@ -130,24 +144,22 @@ class SimulatedAgentCapabilityVault:
         self,
         sender: str,
         agent_id: str,
-        challenger_address: str,
         simulated_reachable: bool,
         simulated_passed: bool,
         simulated_score: int,
         summary: str
     ) -> None:
+        """
+        Permissionless audit:
+        Any caller can trigger the audit. Reward attribution is bound strictly to gl.message.sender_address (caller).
+        No caller-supplied challenger address allowed.
+        """
         assert agent_id in self.agents, "[ERR_STATE_01] Agent record does not exist."
         agent = self.agents[agent_id]
-        sender_clean = sender.lower()
-        challenger_clean = (challenger_address or sender).strip().strip('"').strip("'").lower()
+        caller = sender.lower()
 
-        assert sender_clean == agent["agent_address"] or sender_clean == challenger_clean or sender_clean == self.owner, \
-            "[ERR_AUTH_01] Only registered agent, challenger, or contract owner can trigger probe adjudication."
-
-        assert agent["status"] in ("PROBATION", "ATTESTED_ACTIVE"), \
-            "[ERR_STATE_02] Agent is not in an auditable status."
-        assert agent["staked_deposit"] > 0, \
-            "[ERR_STAKE_02] Agent has no staked deposit to slash or verify."
+        assert agent["status"] in ("PROBATION", "ATTESTED_ACTIVE"),             "[ERR_STATE_02] Agent is not in an auditable status."
+        assert agent["staked_deposit"] > 0,             "[ERR_STAKE_02] Agent has no staked deposit to slash or verify."
 
         staked_now = agent["staked_deposit"]
 
@@ -163,38 +175,75 @@ class SimulatedAgentCapabilityVault:
             # Deterministic slashing: Offline OR incapable slashes 100%
             if self.total_staked_pool >= staked_now:
                 self.total_staked_pool -= staked_now
+            self.total_slashed_pool += staked_now
+
+            # Custody deduction from agent balance
+            agent_addr = agent["agent_address"]
+            current_bal = self.agent_balances.get(agent_addr, 0)
+            if current_bal >= staked_now:
+                self.agent_balances[agent_addr] = current_bal - staked_now
+            else:
+                self.agent_balances[agent_addr] = 0
+
+            # Reward attribution bound strictly to caller
+            self.claimable_rewards[caller] = self.claimable_rewards.get(caller, 0) + staked_now
 
             agent["status"] = "SLASHED_FAILED"
             agent["quality_score"] = simulated_score
             agent["slashed_amount"] = staked_now
             agent["challenger_reward"] = staked_now
+            agent["challenger_address"] = caller
             agent["staked_deposit"] = 0
 
             reason = "Endpoint unreachable / offline." if not simulated_reachable else f"Capability not demonstrated (score: {simulated_score}/100)."
             agent["last_probe_summary"] = (
                 f"BEHAVIORAL PROBE FAILED: {reason} "
-                f"Full deposit of {staked_now} tokens slashed and awarded to challenger {challenger_clean}. {summary}"
+                f"Full deposit of {staked_now} tokens slashed and awarded to challenger {caller}. {summary}"
             )
 
     def withdraw_staked_deposit(self, sender: str, agent_id: str) -> int:
+        """
+        Enforceable stake withdrawal restricted strictly to the agent's registered address.
+        """
         assert agent_id in self.agents, "[ERR_STATE_01] Agent record does not exist."
         agent = self.agents[agent_id]
         sender_clean = sender.lower()
 
-        assert sender_clean == agent["agent_address"], \
-            "[ERR_AUTH_02] Only the registered agent can withdraw active stake."
-        assert agent["status"] == "ATTESTED_ACTIVE", \
-            "[ERR_STATE_03] Stake can only be withdrawn if status is ATTESTED_ACTIVE."
-        assert agent["staked_deposit"] > 0, \
-            "[ERR_STAKE_03] No active staked deposit to withdraw."
+        assert sender_clean == agent["agent_address"],             "[ERR_AUTH_02] Only the registered agent can withdraw active stake."
+        assert agent["status"] == "ATTESTED_ACTIVE",             "[ERR_STATE_03] Stake can only be withdrawn if status is ATTESTED_ACTIVE."
+        assert agent["staked_deposit"] > 0,             "[ERR_STAKE_03] No active staked deposit to withdraw."
 
         withdraw_val = agent["staked_deposit"]
         if self.total_staked_pool >= withdraw_val:
             self.total_staked_pool -= withdraw_val
 
+        current_bal = self.agent_balances.get(sender_clean, 0)
+        if current_bal >= withdraw_val:
+            self.agent_balances[sender_clean] = current_bal - withdraw_val
+        else:
+            self.agent_balances[sender_clean] = 0
+
         agent["staked_deposit"] = 0
         agent["status"] = "WITHDRAWN"
         return withdraw_val
+
+    def claim_challenger_reward(self, sender: str) -> int:
+        """
+        Enforceable slash reward claim path bound strictly to entitled address (caller).
+        """
+        caller = sender.lower()
+        claimable = self.claimable_rewards.get(caller, 0)
+        assert claimable > 0, "[ERR_REWARD_01] No claimable challenger reward balance for caller."
+
+        self.claimable_rewards[caller] = 0
+        self.total_claimed_rewards += claimable
+        return claimable
+
+    def get_claimable_reward(self, address: str) -> int:
+        return self.claimable_rewards.get(address.lower(), 0)
+
+    def get_agent_balance(self, address: str) -> int:
+        return self.agent_balances.get(address.lower(), 0)
 
 
 def run_comprehensive_tests():
@@ -205,6 +254,7 @@ def run_comprehensive_tests():
     owner = "0x417f122c85c17d051b928d2d368d843352ee01ad"
     agent_wallet = "0x1111111111111111111111111111111111111111"
     challenger_wallet = "0x9999999999999999999999999999999999999999"
+    random_third_party = "0x7777777777777777777777777777777777777777"
 
     vault = SimulatedAgentCapabilityVault(owner=owner)
 
@@ -220,6 +270,7 @@ def run_comprehensive_tests():
     assert vault.agents["AGENT_3"]["agent_endpoint"] == "https://ai-agent-network.org/api/v2/code_audit"
     assert vault.agents["AGENT_3"]["status"] == "PROBATION"
     assert vault.total_staked_pool == 12500
+    assert vault.get_agent_balance(agent_wallet) == 2500
     logging.info(f"    [OK] Registered AGENT_3 with preserved route: {vault.agents['AGENT_3']['agent_endpoint']}")
 
     # 2. TEST INVALID REGISTRATION REJECTION
@@ -243,7 +294,6 @@ def run_comprehensive_tests():
     vault.audit_agent_capability(
         sender=agent_wallet,
         agent_id="AGENT_3",
-        challenger_address="",
         simulated_reachable=True,
         simulated_passed=True,
         simulated_score=100,
@@ -256,21 +306,30 @@ def run_comprehensive_tests():
     assert agent_3["slashed_amount"] == 0
     logging.info("    [OK] AGENT_3 successfully attested (Status: ATTESTED_ACTIVE, Score: 100/100, Stake: 2500)")
 
-    # 4. TEST WITHDRAWAL OF ATTESTED STAKE
-    logging.info("--> Test 4: Stake withdrawal by attested agent...")
+    # 4. TEST WITHDRAWAL OF ATTESTED STAKE (ENFORCING ENTITLED ADDRESS)
+    logging.info("--> Test 4: Stake withdrawal restricted to entitled agent address...")
+    # 4a: Imposter attempts to withdraw -> REJECTED
+    try:
+        vault.withdraw_staked_deposit(sender=random_third_party, agent_id="AGENT_3")
+        raise AssertionError("Imposter should not be able to withdraw agent's stake!")
+    except AssertionError as e:
+        assert "[ERR_AUTH_02]" in str(e)
+        logging.info("    [OK] Unauthorized stake withdrawal correctly blocked ([ERR_AUTH_02])")
+
+    # 4b: Genuine agent withdraws
     withdrawn = vault.withdraw_staked_deposit(sender=agent_wallet, agent_id="AGENT_3")
     assert withdrawn == 2500
     assert vault.agents["AGENT_3"]["status"] == "WITHDRAWN"
     assert vault.agents["AGENT_3"]["staked_deposit"] == 0
-    logging.info("    [OK] Agent successfully withdrew active stake (Status: WITHDRAWN)")
+    assert vault.get_agent_balance(agent_wallet) == 0
+    logging.info("    [OK] Agent successfully withdrew active stake (Status: WITHDRAWN, Balance: 0)")
 
-    # 5. TEST UNREACHABLE ENDPOINT AUDIT (SLASHED_FAILED — ZERO CONTROL-FLOW REVERT!)
-    logging.info("--> Test 5: Dead/offline endpoint audit (Slashing with ZERO revert)...")
-    # AGENT_2 has dead endpoint: https://offline-unreachable-agent-node.org/api/probe
+    # 5. TEST PERMISSIONLESS UNREACHABLE ENDPOINT AUDIT & CALLER-BOUND REWARD ATTRIBUTION
+    logging.info("--> Test 5: Permissionless dead-endpoint audit & caller-bound bounty...")
+    # Random caller triggers audit on AGENT_2 (dead endpoint)
     vault.audit_agent_capability(
         sender=challenger_wallet,
         agent_id="AGENT_2",
-        challenger_address=challenger_wallet,
         simulated_reachable=False,  # OFFLINE!
         simulated_passed=False,
         simulated_score=0,
@@ -280,13 +339,33 @@ def run_comprehensive_tests():
     assert agent_2["status"] == "SLASHED_FAILED", f"Expected SLASHED_FAILED, got {agent_2['status']}"
     assert agent_2["staked_deposit"] == 0, "Stake must be completely cleared"
     assert agent_2["slashed_amount"] == 5000, "100% of stake ($5,000) must be slashed"
-    assert agent_2["challenger_reward"] == 5000, "100% of stake must be awarded to challenger"
+    assert agent_2["challenger_reward"] == 5000, "100% of stake must be recorded"
+    assert agent_2["challenger_address"] == challenger_wallet.lower(), "Challenger address must match caller"
+    assert vault.get_claimable_reward(challenger_wallet) == 5000, "Claimable bounty must be 5000 for caller"
+    assert vault.get_claimable_reward(random_third_party) == 0, "Other accounts must have 0 claimable"
     logging.info("    [OK] Unreachable endpoint deterministically slashed with ZERO revert:")
     logging.info(f"         * Slashed: {agent_2['slashed_amount']} tokens")
-    logging.info(f"         * Awarded to Challenger: {agent_2['challenger_reward']} tokens")
+    logging.info(f"         * Awarded to Caller: {agent_2['challenger_reward']} tokens")
 
-    # 6. TEST INCAPABLE AGENT (REACHABLE BUT INCORRECT OUTPUT -> SLASHED)
-    logging.info("--> Test 6: Reachable agent failing capability audit...")
+    # 6. TEST ENFORCEABLE REWARD CLAIM BY CHALLENGER
+    logging.info("--> Test 6: Enforceable slash bounty claim restricted to entitled challenger...")
+    # 6a: Imposter attempts to claim challenger's reward -> REJECTED
+    try:
+        vault.claim_challenger_reward(sender=random_third_party)
+        raise AssertionError("Imposter should not be able to claim someone else's reward!")
+    except AssertionError as e:
+        assert "[ERR_REWARD_01]" in str(e)
+        logging.info("    [OK] Unauthorized reward claim blocked ([ERR_REWARD_01])")
+
+    # 6b: Genuine challenger claims reward
+    claimed = vault.claim_challenger_reward(sender=challenger_wallet)
+    assert claimed == 5000
+    assert vault.get_claimable_reward(challenger_wallet) == 0
+    assert vault.total_claimed_rewards == 5000
+    logging.info("    [OK] Challenger successfully claimed slash reward of 5000 tokens!")
+
+    # 7. TEST INCAPABLE AGENT (REACHABLE BUT INCORRECT OUTPUT -> SLASHED TO CALLER)
+    logging.info("--> Test 7: Incapable agent audit by permissionless third party...")
     a4_id = vault.register_agent(
         sender=agent_wallet,
         endpoint="https://fake-agent-bot.com/api",
@@ -294,9 +373,8 @@ def run_comprehensive_tests():
         stake_amount=1000
     )
     vault.audit_agent_capability(
-        sender=challenger_wallet,
+        sender=random_third_party,
         agent_id=a4_id,
-        challenger_address=challenger_wallet,
         simulated_reachable=True,
         simulated_passed=False,  # Returned generic 400 or spam
         simulated_score=25,
@@ -305,14 +383,15 @@ def run_comprehensive_tests():
     agent_4 = vault.agents[a4_id]
     assert agent_4["status"] == "SLASHED_FAILED"
     assert agent_4["slashed_amount"] == 1000
-    assert agent_4["challenger_reward"] == 1000
-    logging.info("    [OK] Incapable agent deterministically slashed (Status: SLASHED_FAILED, Reward: 1000)")
+    assert agent_4["challenger_address"] == random_third_party.lower()
+    assert vault.get_claimable_reward(random_third_party) == 1000
+    logging.info("    [OK] Incapable agent slashed; 1000 tokens credited to permissionless caller")
 
-    # 7. TEST SYMMETRICAL 2-WAY VALIDATOR CONSENSUS CHECKS
-    logging.info("--> Test 7: Symmetrical 2-way validator criteria enforcement...")
+    # 8. TEST SYMMETRICAL 2-WAY VALIDATOR CONSENSUS CHECKS
+    logging.info("--> Test 8: Symmetrical 2-way validator criteria enforcement...")
     
-    # 7a: Leader claims reachable=True, but response is HTTP 404 error -> MUST REJECT (False positive)
-    res_7a = vault.simulate_2_way_validator_criteria(
+    # 8a: Leader claims reachable=True, but response is HTTP 404 error -> MUST REJECT (False positive)
+    res_8a = vault.simulate_2_way_validator_criteria(
         raw_response="404 Not Found",
         is_http_error_or_empty=True,
         substantively_demonstrates_capability=False,
@@ -320,11 +399,11 @@ def run_comprehensive_tests():
         proposed_passed=False,
         proposed_score=25
     )
-    assert res_7a is False, "Validators must reject false-positive reachability!"
-    logging.info("    [OK] 7a. Rejected false-positive reachability (claims reachable=True on 404 error)")
+    assert res_8a is False, "Validators must reject false-positive reachability!"
+    logging.info("    [OK] 8a. Rejected false-positive reachability (claims reachable=True on 404 error)")
 
-    # 7b: Leader claims reachable=False, but substantive response is present -> MUST REJECT (False negative)
-    res_7b = vault.simulate_2_way_validator_criteria(
+    # 8b: Leader claims reachable=False, but substantive response is present -> MUST REJECT (False negative)
+    res_8b = vault.simulate_2_way_validator_criteria(
         raw_response='{"status":"success","translation":"Bonjour le monde"}',
         is_http_error_or_empty=False,
         substantively_demonstrates_capability=True,
@@ -332,11 +411,11 @@ def run_comprehensive_tests():
         proposed_passed=False,
         proposed_score=0
     )
-    assert res_7b is False, "Validators must reject false-negative reachability!"
-    logging.info("    [OK] 7b. Rejected false-negative reachability (claims reachable=False when body present)")
+    assert res_8b is False, "Validators must reject false-negative reachability!"
+    logging.info("    [OK] 8b. Rejected false-negative reachability (claims reachable=False when body present)")
 
-    # 7c: Leader claims passed=True, but content is placeholder -> MUST REJECT (False positive)
-    res_7c = vault.simulate_2_way_validator_criteria(
+    # 8c: Leader claims passed=True, but content is placeholder -> MUST REJECT (False positive)
+    res_8c = vault.simulate_2_way_validator_criteria(
         raw_response="Under construction. Coming soon.",
         is_http_error_or_empty=False,
         substantively_demonstrates_capability=False,
@@ -344,11 +423,11 @@ def run_comprehensive_tests():
         proposed_passed=True,
         proposed_score=100
     )
-    assert res_7c is False, "Validators must reject false-positive capability!"
-    logging.info("    [OK] 7c. Rejected false-positive capability (claims passed=True on placeholder)")
+    assert res_8c is False, "Validators must reject false-positive capability!"
+    logging.info("    [OK] 8c. Rejected false-positive capability (claims passed=True on placeholder)")
 
-    # 7d: Leader claims passed=False, but capability is clearly proven -> MUST REJECT (False negative)
-    res_7d = vault.simulate_2_way_validator_criteria(
+    # 8d: Leader claims passed=False, but capability is clearly proven -> MUST REJECT (False negative)
+    res_8d = vault.simulate_2_way_validator_criteria(
         raw_response='{"status":"success","translation":"Bonjour le monde"}',
         is_http_error_or_empty=False,
         substantively_demonstrates_capability=True,
@@ -356,11 +435,11 @@ def run_comprehensive_tests():
         proposed_passed=False,
         proposed_score=25
     )
-    assert res_7d is False, "Validators must reject false-negative capability!"
-    logging.info("    [OK] 7d. Rejected false-negative capability (claims passed=False on proven output)")
+    assert res_8d is False, "Validators must reject false-negative capability!"
+    logging.info("    [OK] 8d. Rejected false-negative capability (claims passed=False on proven output)")
 
-    # 7e: Quality score rubric deviation -> MUST REJECT
-    res_7e = vault.simulate_2_way_validator_criteria(
+    # 8e: Quality score rubric deviation -> MUST REJECT
+    res_8e = vault.simulate_2_way_validator_criteria(
         raw_response="404 Not Found",
         is_http_error_or_empty=True,
         substantively_demonstrates_capability=False,
@@ -368,11 +447,11 @@ def run_comprehensive_tests():
         proposed_passed=False,
         proposed_score=50  # Should be 0!
     )
-    assert res_7e is False, "Validators must reject rubric deviation!"
-    logging.info("    [OK] 7e. Rejected quality score rubric deviation")
+    assert res_8e is False, "Validators must reject rubric deviation!"
+    logging.info("    [OK] 8e. Rejected quality score rubric deviation")
 
-    # 7f: Completely truthful passing proposal -> ACCEPTED
-    res_7f = vault.simulate_2_way_validator_criteria(
+    # 8f: Completely truthful passing proposal -> ACCEPTED
+    res_8f = vault.simulate_2_way_validator_criteria(
         raw_response='{"status":"success","analysis":"Clean code"}',
         is_http_error_or_empty=False,
         substantively_demonstrates_capability=True,
@@ -380,11 +459,11 @@ def run_comprehensive_tests():
         proposed_passed=True,
         proposed_score=100
     )
-    assert res_7f is True, "Truthful proposal must be accepted!"
-    logging.info("    [OK] 7f. Accepted 100% truthful, 2-way verified consensus proposal")
+    assert res_8f is True, "Truthful proposal must be accepted!"
+    logging.info("    [OK] 8f. Accepted 100% truthful, 2-way verified consensus proposal")
 
     logging.info("=" * 80)
-    logging.info("  ALL 7 STEWARD REMEDIATION TEST SUITES 100% PASSING!")
+    logging.info("  ALL 8 STEWARD REMEDIATION TEST SUITES 100% PASSING!")
     logging.info("=" * 80)
 
 

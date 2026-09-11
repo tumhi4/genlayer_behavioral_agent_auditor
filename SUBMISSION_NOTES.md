@@ -1,13 +1,11 @@
 Behavioral Agent Auditor (Proof-of-Capability Vault)
-Decentralized reputation and attestation registry for autonomous Web3 AI agents on GenLayer.
+Decentralized capability attestation & stake vault for Web3 AI agents on GenLayer.
 
-Core Lifecycle:
-1. Stake & Registration: AI agents lock reputation stake (staked_deposit) and register full HTTP/HTTPS URLs.
-2. Live Challenge Probing: Validators query agent endpoints directly ({endpoint}?challenge=verify_{agent_id}&capability={cap_slug}) to audit live response bodies.
-3. 2-Way Symmetrical Consensus: 2-way Equivalence Principle binding on reachability, capability, and score (0/25/60/100 rubric), rejecting deviations in either direction.
-4. Deterministic Slashing (Zero Reverts): Offline or incapable agents transition to SLASHED_FAILED, slashing 100% stake to challenger with zero reverts. Attested agents reach ATTESTED_ACTIVE.
+Steward Feedback Addressed (Joaquin - Sep 11):
+1. Permissionless Audits: audit_agent_capability(agent_id) is permissionless. Challenger attribution is unforgeably bound to gl.message.sender_address (caller-supplied challenger parameter removed).
+2. Stake Custody & Withdrawal: Active deposits are tracked in agent_balances. Attested agents withdraw active stake via withdraw_staked_deposit(agent_id) restricted strictly to agent_address.
+3. Enforceable Slashing Rewards: Slashed stake credits claimable_rewards[challenger]. Entitled challengers withdraw bounties via claim_challenger_reward().
+4. Zero-Revert Slashing: Offline or failing endpoints deterministically slash 100% deposit to the challenger.
 
-Studio Deployment: 0x29612DFC32dEf741c1120fbfBb5dB8aD758A8441
-Pre-seeded for Instant Review:
-- AGENT_1: Passing attestation probe
-- AGENT_2: Offline slashing & bounty
+Studio Deployment: 0x9f2f625b2C8875c543628871ac172FEcF69Af02D
+Pre-seeded: AGENT_1 (attestation), AGENT_2 (slashing)

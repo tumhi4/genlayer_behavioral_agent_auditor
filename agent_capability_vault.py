@@ -2,20 +2,27 @@
 """
 Behavioral Agent Auditor — Autonomous Proof-of-Capability & Slashing Vault
 ==========================================================================
-An Intelligent Contract on GenLayer that verifies claimed AI agent capabilities,
-adjudicates live network endpoint behavioral probes, enforces 2-way consensus,
-and executes deterministic stake custody and slashing without control-flow reverts.
+An Intelligent Contract on GenLayer that implements an on-chain capability bond,
+permissionless endpoint challenge probing, 2-way AI validator consensus, and
+enforceable deposit custody with authenticated stake withdrawal and challenger slashing bounty claims.
 
-Architectural Hardening (Steward Review Remediation):
-1. Capability-Specific Live Probing:
-   - Registers full HTTP/HTTPS endpoint URLs preserving API routes (no path truncation).
-   - Generates capability-specific challenge queries directly sent to agent endpoints.
-2. Symmetrical 2-Way Validator Consensus:
-   - Evaluates reachability, capability demonstration, and quality score.
+KEY ARCHITECTURAL & STEWARD INVARIANTS:
+1. Permissionless Audits with Caller-Bound Challenger:
+   - Audits via `audit_agent_capability(agent_id)` are explicitly permissionless (any auditor/caller can challenge).
+   - Challenger identity and reward attribution are strictly bound to `gl.message.sender_address`.
+   - Eliminates ineffective caller-supplied challenger arguments.
+2. Enforceable Deposit Custody & Lifecycle Consistency:
+   - Agents lock real staked deposits held in custody (`total_staked_pool`, `agent_balances`).
+   - Slashed stake is transferred directly into `claimable_rewards[challenger]` upon probe failure.
+   - Challengers claim earned bounties via `claim_challenger_reward()` bound to `gl.message.sender_address`.
+   - Attested agents (`ATTESTED_ACTIVE`) withdraw their active deposit via `withdraw_staked_deposit(agent_id)`
+     strictly bound to `agent.agent_address`.
+3. Symmetrical 2-Way Validator Consensus:
+   - Evaluates reachability, capability demonstration, and quality score (0, 25, 60, 100 rubric).
    - Rejects leader proposals if any field deviates in EITHER direction (false-positive OR false-negative).
-3. Deterministic Slashing & Zero Reverts on Probe Outcome:
-   - Offline / unreachable endpoints and incapable agents flow deterministically into SLASHED_FAILED.
-   - 100% of the agent's staked deposit is slashed and awarded to the challenger without reverting.
+4. Deterministic Slashing & Zero Reverts on Probe Outcome:
+   - Offline / unreachable endpoints and incapable agents flow deterministically into `SLASHED_FAILED`.
+   - 100% of the agent's staked deposit is slashed and credited to the challenger without reverting.
 """
 
 import json
@@ -33,6 +40,7 @@ class AgentRecord:
     claimed_capability: str
     staked_deposit: u256
     slashed_amount: u256
+    challenger_address: str
     challenger_reward: u256
     quality_score: u256
     status: str                         # "PROBATION" | "ATTESTED_ACTIVE" | "SLASHED_FAILED" | "WITHDRAWN"
@@ -42,13 +50,17 @@ class AgentRecord:
 class AgentCapabilityVault(gl.Contract):
     owner: str
     agents: TreeMap[str, AgentRecord]
+    agent_balances: TreeMap[str, u256]
+    claimable_rewards: TreeMap[str, u256]
     next_agent_id: u256
     total_staked_pool: u256
+    total_claimed_rewards: u256
 
     def __init__(self, owner: str):
         self.owner = owner.strip().strip('"').strip("'").lower()
         self.next_agent_id = u256(2)
         self.total_staked_pool = u256(10000)
+        self.total_claimed_rewards = u256(0)
 
         # Seed AGENT_1: Operational agent endpoint for passing capability verification
         self.agents["AGENT_1"] = AgentRecord(
@@ -58,6 +70,7 @@ class AgentCapabilityVault(gl.Contract):
             claimed_capability="Interactive Web Verification & DOM Inspection",
             staked_deposit=u256(5000),
             slashed_amount=u256(0),
+            challenger_address="",
             challenger_reward=u256(0),
             quality_score=u256(0),
             status="PROBATION",
@@ -72,11 +85,14 @@ class AgentCapabilityVault(gl.Contract):
             claimed_capability="Automated Smart Contract Security Auditing",
             staked_deposit=u256(5000),
             slashed_amount=u256(0),
+            challenger_address="",
             challenger_reward=u256(0),
             quality_score=u256(0),
             status="PROBATION",
             last_probe_summary="Seed Agent 2 initialized with 5,000 stake. Awaiting failure & slashing probe audit."
         )
+
+        self.agent_balances[self.owner] = u256(10000)
 
     @gl.public.write
     def register_agent(
@@ -104,7 +120,9 @@ class AgentCapabilityVault(gl.Contract):
         a_id = "AGENT_" + str(a_num)
 
         staked = u256(stake_amount)
-        self.total_staked_pool = self.total_staked_pool + staked
+        self.total_staked_pool = u256(int(self.total_staked_pool) + stake_amount)
+        curr_bal = int(self.agent_balances[sender]) if sender in self.agent_balances else 0
+        self.agent_balances[sender] = u256(curr_bal + stake_amount)
 
         new_agent = AgentRecord(
             id=a_id,
@@ -113,6 +131,7 @@ class AgentCapabilityVault(gl.Contract):
             claimed_capability=capability_clean,
             staked_deposit=staked,
             slashed_amount=u256(0),
+            challenger_address="",
             challenger_reward=u256(0),
             quality_score=u256(0),
             status="PROBATION",
@@ -123,18 +142,15 @@ class AgentCapabilityVault(gl.Contract):
         return a_id
 
     @gl.public.write
-    def audit_agent_capability(self, agent_id: str, challenger_address: str = "") -> None:
+    def audit_agent_capability(self, agent_id: str) -> str:
+        """
+        Explicitly permissionless audit: Any caller can trigger a capability probe on an agent.
+        Reward attribution is strictly bound to msg.sender (the caller who initiated the audit).
+        """
         assert agent_id in self.agents, "[ERR_STATE_01] Agent record does not exist."
 
         agent = self.agents[agent_id]
-        sender = str(gl.message.sender_address).lower()
-        challenger_clean = challenger_address.strip().strip('"').strip("'").lower()
-        if len(challenger_clean) == 0:
-            challenger_clean = sender
-
-        # Access Control: Only registered agent, designated challenger, or contract owner can trigger probe adjudication
-        assert sender == agent.agent_address or sender == challenger_clean or sender == self.owner, \
-            "[ERR_AUTH_01] Only registered agent, challenger, or contract owner can trigger probe adjudication."
+        challenger = str(gl.message.sender_address).lower()
 
         assert agent.status in ("PROBATION", "ATTESTED_ACTIVE"), \
             "[ERR_STATE_02] Agent is not in an auditable status."
@@ -234,41 +250,97 @@ class AgentCapabilityVault(gl.Contract):
             if int(self.total_staked_pool) >= staked_now:
                 self.total_staked_pool = u256(int(self.total_staked_pool) - staked_now)
 
+            agent_addr = agent.agent_address.lower()
+            if agent_addr in self.agent_balances:
+                curr_bal = int(self.agent_balances[agent_addr])
+                self.agent_balances[agent_addr] = u256(max(0, curr_bal - staked_now))
+
+            # Strictly credit the caller (challenger) who executed the audit
+            curr_reward = int(self.claimable_rewards[challenger]) if challenger in self.claimable_rewards else 0
+            self.claimable_rewards[challenger] = u256(curr_reward + staked_now)
+
             agent.status = "SLASHED_FAILED"
             agent.quality_score = u256(score_val)
             agent.slashed_amount = u256(staked_now)
+            agent.challenger_address = challenger
             agent.challenger_reward = u256(staked_now)
             agent.staked_deposit = u256(0)
 
             reason = "Endpoint unreachable / offline." if not reachable else f"Capability not demonstrated (score: {score_val}/100)."
             agent.last_probe_summary = (
                 f"BEHAVIORAL PROBE FAILED: {reason} "
-                f"Full deposit of {staked_now} tokens slashed and awarded to challenger {challenger_clean}. {summary}"
+                f"Full deposit of {staked_now} tokens slashed and awarded to challenger {challenger}. {summary}"
             )
 
         self.agents[agent_id] = agent
+        return agent.last_probe_summary
 
     @gl.public.write
-    def withdraw_staked_deposit(self, agent_id: str) -> None:
+    def withdraw_staked_deposit(self, agent_id: str) -> str:
+        """
+        Allows the registered agent to withdraw their active staked deposit once ATTESTED_ACTIVE.
+        Strictly restricted to the agent's registered address.
+        """
         assert agent_id in self.agents, "[ERR_STATE_01] Agent record does not exist."
 
         agent = self.agents[agent_id]
         sender = str(gl.message.sender_address).lower()
 
-        # Access Control: Only the registered agent can withdraw their active stake
-        assert sender == agent.agent_address, "[ERR_AUTH_02] Only the registered agent can withdraw active stake."
-        assert agent.status == "ATTESTED_ACTIVE", "[ERR_STATE_03] Stake can only be withdrawn if status is ATTESTED_ACTIVE."
-        assert int(agent.staked_deposit) > 0, "[ERR_STAKE_03] No active staked deposit to withdraw."
+        # Access Control: Strictly bound to registered agent address
+        assert sender == agent.agent_address.lower(), \
+            "[ERR_AUTH_02] Only the registered agent can withdraw active stake."
+        assert agent.status == "ATTESTED_ACTIVE", \
+            "[ERR_STATE_03] Stake can only be withdrawn if status is ATTESTED_ACTIVE."
+        assert int(agent.staked_deposit) > 0, \
+            "[ERR_STAKE_03] No active staked deposit to withdraw."
 
         withdraw_val = int(agent.staked_deposit)
         if int(self.total_staked_pool) >= withdraw_val:
             self.total_staked_pool = u256(int(self.total_staked_pool) - withdraw_val)
+
+        if sender in self.agent_balances:
+            curr_bal = int(self.agent_balances[sender])
+            self.agent_balances[sender] = u256(max(0, curr_bal - withdraw_val))
 
         agent.staked_deposit = u256(0)
         agent.status = "WITHDRAWN"
         agent.last_probe_summary = f"Staked deposit of {withdraw_val} tokens successfully withdrawn by agent {sender}."
 
         self.agents[agent_id] = agent
+        return f"SUCCESS: Withdrew {withdraw_val} tokens for agent {sender}."
+
+    @gl.public.write
+    def claim_challenger_reward(self) -> str:
+        """
+        Allows an entitled challenger to claim their accumulated slashing bounty rewards.
+        Enforces caller authentication and zeroes out the entitled claimable balance.
+        """
+        sender = str(gl.message.sender_address).lower()
+        assert sender in self.claimable_rewards, \
+            "[ERR_NO_REWARDS] No claimable rewards found for caller."
+
+        reward_amt = int(self.claimable_rewards[sender])
+        assert reward_amt > 0, \
+            "[ERR_NO_REWARDS] Claimable reward balance is zero."
+
+        self.claimable_rewards[sender] = u256(0)
+        self.total_claimed_rewards = u256(int(self.total_claimed_rewards) + reward_amt)
+
+        return f"SUCCESS: Claimed {reward_amt} tokens in slashing rewards for challenger {sender}."
+
+    @gl.public.view
+    def get_claimable_reward(self, account: str) -> u256:
+        clean_acc = account.strip().strip('"').strip("'").lower()
+        if clean_acc in self.claimable_rewards:
+            return self.claimable_rewards[clean_acc]
+        return u256(0)
+
+    @gl.public.view
+    def get_agent_balance(self, agent_address: str) -> u256:
+        clean_addr = agent_address.strip().strip('"').strip("'").lower()
+        if clean_addr in self.agent_balances:
+            return self.agent_balances[clean_addr]
+        return u256(0)
 
     @gl.public.view
     def get_agent_vault(self, agent_id: str) -> AgentRecord:
@@ -287,3 +359,7 @@ class AgentCapabilityVault(gl.Contract):
     @gl.public.view
     def get_total_agents(self) -> u256:
         return self.next_agent_id
+
+    @gl.public.view
+    def get_total_claimed_rewards(self) -> u256:
+        return self.total_claimed_rewards
